@@ -1,7 +1,7 @@
 'use client';
 import AdminAuthGuard from '@/app/components/admin/AdminAuthGuard';
 import AdminLayout from '@/app/components/admin/AdminLayout';
-import PayoutsManager from '@/app/components/admin/PayoutsManager';
+
 
 export default function PayoutsPage() {
   return (
