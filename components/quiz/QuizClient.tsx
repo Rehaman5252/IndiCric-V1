@@ -1,0 +1,611 @@
+'use client';
+
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { useRouter } from 'next/navigation';
+import { useAuth } from '@/context/AuthProvider';
+import { QuizData as QuizDataSchema, type QuizData, type QuizQuestion, type HintOutput } from '@/ai/schemas';
+import { CricketLoading } from '@/components/CricketLoading';
+import QuizView from '@/components/quiz/QuizView';
+import InterstitialLoader from '@/components/InterstitialLoader';
+import { AdDialog } from '@/components/AdDialog';
+// ✅ UPDATED IMPORTS
+import { generateHint } from '@/ai/flows/ai-powered-hints';
+import { generateQuizAnalysis } from '@/ai/flows/generate-quiz-analysis';
+import { type InterstitialAdConfig } from '@/lib/ads';
+import { getInterstitialAdForSlot } from '@/lib/ads';
+import { useToast } from '@/hooks/use-toast';
+import { useSettings } from '@/hooks/use-settings';
+import { buildAttempt, encodeAttempt } from '@/lib/quiz-utils';
+import PreQuizLoader from './PreQuizLoader';
+import { Button } from '../ui/button';
+import { AlertTriangle, ShieldCheck } from 'lucide-react';
+import { isFirebaseConfigured, db } from '@/lib/firebase';
+import { motion } from 'framer-motion';
+import { getQuizSlotId } from '@/lib/utils';
+import LoginPrompt from '../auth/LoginPrompt';
+import { logger } from '@/app/lib/logger';
+import { fromZodError } from 'zod-validation-error';
+import { collection, addDoc, serverTimestamp } from 'firebase/firestore';
+
+interface QuizClientProps {
+  brand: string;
+  format: string;
+}
+
+type QuizState = 'loading' | 'pre-quiz' | 'playing' | 'ad-showing' | 'submitting' | 'error' | 'unauthenticated';
+
+type QuizAPIResponse = {
+  ok: boolean;
+  quiz: QuizData;
+  source?: 'ai' | 'fallback';
+  reqId?: string;
+  error?: { message: string };
+  errorDetails?: { message: string, originalError: string, code: string };
+};
+
+const IS_DEV = process.env.NODE_ENV !== "production";
+
+interface HintAdConfig {
+  duration: number;
+  skippableAfter: number;
+  title: string;
+  type: 'image' | 'video';
+  url: string;
+  hint?: string;
+}
+
+async function logQuizAttempt(userId: string, quizId: string, score: number) {
+  try {
+    await addDoc(collection(db, 'quizAttempts'), {
+      userId,
+      quizId,
+      score,
+      completed: true,
+      timestamp: serverTimestamp()
+    });
+    logger.info('Quiz attempt logged to Firestore', { userId, quizId, score });
+  } catch (error) {
+    logger.error('Failed to log quiz attempt', { error });
+  }
+}
+
+export default function QuizClient({ brand, format }: QuizClientProps) {
+  const [quizState, setQuizState] = useState<QuizState>('loading');
+  const [quizData, setQuizData] = useState<QuizData | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
+  const [userAnswers, setUserAnswers] = useState<string[]>([]);
+  const [timePerQuestion, setTimePerQuestion] = useState<number[]>([]);
+  const [startTime, setStartTime] = useState<number>(0);
+  const [quizSource, setQuizSource] = useState<'ai' | 'fallback'>('ai');
+  const [showAdDialog, setShowAdDialog] = useState(false);
+  const [adForHint, setAdForHint] = useState<HintAdConfig | null>(null);
+  const [hints, setHints] = useState<Record<number, HintOutput>>({});
+  const [isHintLoading, setIsHintLoading] = useState(false);
+  
+  const [currentInterstitialConfig, setCurrentInterstitialConfig] = useState<InterstitialAdConfig | null>(null);
+  const [nextQuestionIndexPending, setNextQuestionIndexPending] = useState<number | null>(null);
+  
+  const router = useRouter();
+  const { user, addQuizAttempt, handleMalpractice, loading: authLoading, isOffline } = useAuth();
+  const { toast } = useToast();
+  const quizViewRef = useRef<any>(null);
+  const { settings } = useSettings();
+  const isFinishedRef = useRef(false);
+  const abortControllerRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const slotId = getQuizSlotId();
+      if (sessionStorage.getItem(`quiz-finished-${slotId}`)) {
+        isFinishedRef.current = true;
+        router.replace('/');
+      }
+    }
+  }, [router]);
+
+  const fetchAndSetInterstitialAd = useCallback(async (qIndex: number): Promise<InterstitialAdConfig | null> => {
+    const adSlot = 
+      qIndex === 1 ? 'Q1_Q2' :
+      qIndex === 2 ? 'Q2_Q3' :
+      qIndex === 3 ? 'Q3_Q4' :
+      qIndex === 4 ? 'Q4_Q5' :
+      null;
+    
+    if (!adSlot) {
+      console.log(`⏭️ [AdFetch] No ad slot for Q${qIndex}`);
+      return null;
+    }
+
+    try {
+      console.log(`🔍 [AdFetch] Fetching Firebase ad for slot: ${adSlot}`);
+      const config = await getInterstitialAdForSlot(adSlot as any);
+      
+      if (config) {
+        console.log(`✅ [AdFetch] Firebase ad LOADED for ${adSlot}:`, {
+          type: config.type,
+          durationSec: config.durationSec,
+          durationMs: config.durationMs,
+          skippableAfterSec: config.skippableAfterSec,
+          videoUrl: config.videoUrl ? '✓' : '✗',
+          logoUrl: config.logoUrl ? '✓' : '✗'
+        });
+        setCurrentInterstitialConfig(config);
+        return config;
+      } else {
+        console.log(`⚠️ [AdFetch] No ad found for ${adSlot}`);
+        setCurrentInterstitialConfig(null);
+        return null;
+      }
+    } catch (err) {
+      console.error(`❌ [AdFetch] Error fetching ad:`, err);
+      setCurrentInterstitialConfig(null);
+      return null;
+    }
+  }, []);
+
+  const fetchQuiz = useCallback(async () => {
+    if (isFinishedRef.current || authLoading) return;
+    abortControllerRef.current?.abort();
+
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
+    setQuizState('loading');
+    setError(null);
+
+    if (!user) {
+      setQuizState('unauthenticated');
+      return;
+    }
+    if (isOffline) {
+      setError("You appear to be offline. Please check your connection.");
+      setQuizState('error');
+      return;
+    }
+    if (!isFirebaseConfigured) {
+      setError("🔥 The app is not connected to the server. Please try again later.");
+      setQuizState('error');
+      return;
+    }
+    
+    try {
+      const response = await fetch('/api/quiz', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ format, userId: user.uid }),
+        signal: controller.signal,
+      });
+
+      if (controller.signal.aborted) return;
+      
+      const responseText = await response.text();
+      let data: QuizAPIResponse;
+      
+      try {
+        data = JSON.parse(responseText);
+      } catch(parseErr) {
+        logger.error('Quiz API returned non-json:', { responseText });
+        throw new Error('Server returned an unexpected response. Please try again.');
+      }
+      
+      const quizValidation = QuizDataSchema.safeParse(data.quiz);
+
+      if (!data.ok || !data.quiz || !quizValidation.success) {
+         const msg = data.error?.message || data.errorDetails?.message || "Invalid quiz data received.";
+         if (!quizValidation.success) {
+            const validationError = fromZodError(quizValidation.error).message;
+            logger.warn('Invalid quiz data received from API', { validationError, reqId: data.reqId });
+         } else {
+            logger.warn('Invalid quiz data received from API', { error: 'data.ok was false or data.quiz was null', reqId: data.reqId });
+         }
+         setError(msg);
+         setQuizState('error');
+         return;
+      }
+      
+      if (data.source === 'fallback' && data.errorDetails) {
+          let friendlyTitle = "Standard Quiz Loaded";
+          let friendlyDesc = "The AI is warming up, so here's a ready-made quiz for you.";
+
+          if (IS_DEV) {
+            friendlyDesc += ` (Dev: ${data.reqId} - ${data.errorDetails.message})`;
+          }
+
+          toast({
+              title: friendlyTitle,
+              description: friendlyDesc,
+              duration: 7000,
+          });
+      }
+
+      setQuizData(data.quiz);
+      setQuizSource(data.source || 'ai');
+      setQuizState('pre-quiz');
+      
+    } catch (e: any) {
+      if (e.name === 'AbortError') return;
+      logger.error("Quiz fetch failed:", { message: e.message });
+      let userMessage = "Could not load quiz. The AI might be busy. Please try again.";
+      
+      if (typeof e.message === 'string' && e.message.includes("Failed to fetch")) {
+          userMessage = "📴 You appear to be offline. Please check your connection.";
+      } else if (typeof e.message === 'string') {
+          userMessage = e.message;
+      }
+      
+      setError(userMessage);
+      setQuizState('error');
+    }
+  }, [format, user, authLoading, isOffline, toast]);
+
+  useEffect(() => {
+    if (!authLoading) {
+        fetchQuiz();
+    }
+    return () => {
+        abortControllerRef.current?.abort();
+    };
+  }, [fetchQuiz, authLoading]);
+
+  const handlePreQuizFinish = useCallback(() => {
+    if (isFinishedRef.current) return;
+    logger.event('quiz_start', { format, brand, source: quizSource });
+    setQuizState('playing');
+    setStartTime(Date.now());
+  }, [format, brand, quizSource]);
+
+  const finishQuiz = useCallback(async (finalAnswers: string[], finalTimePerQuestion: number[]) => {
+  if (isFinishedRef.current || !quizData || !user) return;
+  isFinishedRef.current = true; 
+  setQuizState('submitting');
+  
+  const attempt = buildAttempt({
+    user,
+    quizData,
+    brand,
+    format,
+    userAnswers: finalAnswers,
+    timePerQuestion: finalTimePerQuestion,
+    source: quizSource,
+  });
+  
+  // ✅ Play perfect sound if all answers correct, else play next sound
+  if (attempt.score === attempt.totalQuestions && quizViewRef.current) {
+    quizViewRef.current.playPerfectSound();
+  } else if (quizViewRef.current) {
+    quizViewRef.current.playNextSound();
+  }
+  
+  logger.event('quiz_complete', {
+      format,
+      brand,
+      score: attempt.score,
+      totalQuestions: attempt.totalQuestions,
+      source: quizSource,
+      disqualified: false,
+      reason: null,
+  });
+  
+  sessionStorage.setItem(`quiz-finished-${attempt.slotId}`, "true");
+
+  await logQuizAttempt(user.uid, attempt.slotId, attempt.score);
+
+  // ✅ GENERATE AI ANALYSIS
+  try {
+    const analysisInput = {
+      questions: quizData.questions.map((q, i) => ({
+        question: q.question,
+        correctAnswer: q.correctAnswer,
+        userAnswer: finalAnswers[i] || 'No answer',
+        isCorrect: finalAnswers[i] === q.correctAnswer
+      })),
+      score: attempt.score,
+      totalQuestions: attempt.totalQuestions,
+      format: format
+    };
+    
+    const analysis = await generateQuizAnalysis(analysisInput);
+    
+    // Store analysis for results page
+    sessionStorage.setItem(`quiz-analysis-${attempt.slotId}`, JSON.stringify(analysis));
+    
+    logger.info("Quiz analysis generated", { score: attempt.score });
+  } catch (error: any) {
+    logger.warn("Failed to generate quiz analysis", { error: error.message });
+    // Continue anyway - analysis is optional
+  }
+
+  const { success } = await addQuizAttempt(attempt);
+
+  if (success) {
+      router.replace(`/quiz/results?attempt=${encodeAttempt(attempt)}`);
+  } else {
+      router.replace(`/quiz/results?attempt=${encodeAttempt(attempt)}`);
+  }
+}, [quizData, user, brand, format, addQuizAttempt, router, quizSource]);
+
+
+  const handleNoBall = useCallback(async (reason: 'no-ball') => {
+  if (isFinishedRef.current || !quizData || !user) return;
+  isFinishedRef.current = true;
+  setQuizState('submitting');
+  
+  // ✅ Play disqualified sound
+  if (quizViewRef.current) {
+    quizViewRef.current.playDisqualifiedSound();
+  }
+  
+  const noBallCount = await handleMalpractice();
+  toast({
+      title: "No Ball!",
+      description: `Malpractice detected. You have ${noBallCount} no-ball(s). 3 no-balls and you're out!`,
+      variant: "destructive"
+  });
+  const attempt = buildAttempt({
+    user,
+    quizData,
+    brand,
+    format,
+    userAnswers,
+    timePerQuestion,
+    overrides: { reason, score: 0 },
+    source: quizSource,
+  });
+  logger.event('quiz_complete', {
+      format,
+      brand,
+      score: 0,
+      totalQuestions: attempt.totalQuestions,
+      source: quizSource,
+      disqualified: true,
+      reason,
+  });
+  sessionStorage.setItem(`quiz-finished-${attempt.slotId}`, "true");
+  const { success } = await addQuizAttempt(attempt);
+  if (success) {
+    router.replace(`/quiz/results?attempt=${encodeAttempt(attempt)}`);
+  } else {
+    router.replace(`/quiz/results?attempt=${encodeAttempt(attempt)}`);
+  }
+}, [handleMalpractice, toast, quizData, user, brand, format, userAnswers, timePerQuestion, addQuizAttempt, router, quizSource]);
+
+
+  const handleNextQuestion = useCallback(async (answer: string) => {
+  if (isFinishedRef.current) return;
+  const endTime = Date.now();
+  const timeTaken = (endTime - startTime) / 1000;
+  const updatedAnswers = [...userAnswers, answer];
+  const updatedTime = [...timePerQuestion, parseFloat(timeTaken.toFixed(2))];
+  setUserAnswers(updatedAnswers);
+  setTimePerQuestion(updatedTime);
+  
+  const nextQuestionIndex = currentQuestionIndex + 1;
+  
+  // ✅ Play "next" sound when moving to next question
+  if (quizViewRef.current) {
+    quizViewRef.current.playNextSound();
+  }
+  
+  if (quizData && nextQuestionIndex < quizData.questions.length) {
+      console.log(`📝 [Quiz] Answer Q${currentQuestionIndex + 1}, moving to Q${nextQuestionIndex + 1}`);
+      
+      const adConfig = await fetchAndSetInterstitialAd(nextQuestionIndex);
+      
+      if (adConfig) {
+          console.log(`📺 [Quiz] Ad fetched successfully, showing ad state`);
+          setNextQuestionIndexPending(nextQuestionIndex);
+          setQuizState('ad-showing');
+      } else {
+          console.log(`⏭️ [Quiz] No ad for Q${nextQuestionIndex + 1}, skipping to question`);
+          setCurrentQuestionIndex(nextQuestionIndex);
+          setStartTime(Date.now());
+          setQuizState('playing');
+      }
+  } else {
+    finishQuiz(updatedAnswers, updatedTime);
+  }
+}, [startTime, currentQuestionIndex, quizData, finishQuiz, fetchAndSetInterstitialAd, userAnswers, timePerQuestion]);
+
+
+  const onAdFinished = useCallback(() => {
+    console.log(`✅ [Ad] Finished, moving to next question`);
+    if (nextQuestionIndexPending !== null) {
+      setCurrentQuestionIndex(nextQuestionIndexPending);
+      setNextQuestionIndexPending(null);
+    }
+    setCurrentInterstitialConfig(null);
+    setStartTime(Date.now());
+    setQuizState('playing');
+  }, [nextQuestionIndexPending]);
+
+  const handleHintRequest = useCallback(async () => {
+    if (!quizData || isHintLoading) return;
+    const fallbackHintAd: HintAdConfig = {
+      duration: 5,
+      skippableAfter: 2,
+      title: 'Hint',
+      type: 'image',
+      url: 'https://via.placeholder.com/300',
+    };
+    setAdForHint(fallbackHintAd);
+    setShowAdDialog(true);
+  }, [quizData, isHintLoading]);
+
+  // ✅ UPDATED: Fixed hint generation
+  const handleAdFinished = useCallback(async () => {
+    setShowAdDialog(false);
+    if (!adForHint || !quizData) return;
+    
+    setIsHintLoading(true);
+    try {
+      const currentQ = quizData.questions[currentQuestionIndex];
+      
+      // ✅ Call generateHint with correct parameters
+      const hintText = await generateHint({
+        question: currentQ.question,
+        correctAnswer: currentQ.correctAnswer
+      });
+      
+      // ✅ Store hint in the expected format
+      setHints(prev => ({ 
+        ...prev, 
+        [currentQuestionIndex]: { 
+          hint: hintText,
+          source: "ai"
+        } 
+      }));
+      
+      logger.info("AI hint generated successfully", { questionIndex: currentQuestionIndex });
+    } catch (e: any) {
+      logger.error("Failed to get AI hint:", { error: e.message });
+      
+      // ✅ Fallback hint
+      setHints(prev => ({ 
+        ...prev, 
+        [currentQuestionIndex]: { 
+          hint: "Couldn't get a hint this time. Think about the player's most famous matches and achievements.", 
+          source: "fallback"
+        } 
+      }));
+      
+      toast({
+        title: "Hint unavailable",
+        description: "AI is busy. Try again or think about the context!",
+        variant: "default"
+      });
+    } finally {
+      setIsHintLoading(false);
+    }
+    setAdForHint(null);
+  }, [adForHint, quizData, currentQuestionIndex, toast]);
+  
+  if (quizState === 'loading' || authLoading) {
+    return (
+        <div className="flex flex-col items-center justify-center min-h-screen text-muted-foreground p-4 text-center">
+             <CricketLoading />
+            <p className="mb-4 mt-4">Warming up...</p>
+        </div>
+    );
+  }
+  if (quizState === 'unauthenticated') {
+    return (
+        <div className="flex flex-col items-center justify-center min-h-screen p-4">
+            <LoginPrompt 
+                icon={AlertTriangle}
+                title="Authentication Required"
+                description="Please sign in to play a quiz."
+            />
+        </div>
+    );
+  }
+  if (quizState === 'pre-quiz' && quizData) {
+      return <PreQuizLoader format={format} onFinish={handlePreQuizFinish} />;
+  }
+  if (quizState === 'error') {
+    return (
+        <div className="flex flex-col items-center justify-center min-h-screen text-destructive p-4 text-center">
+            <AlertTriangle className="h-12 w-12 mb-4" />
+            <p className="font-semibold mb-4">{error || "An unknown error occurred."}</p>
+            <Button onClick={fetchQuiz}>Try Again</Button>
+        </div>
+    );
+  }
+  if (quizState === 'submitting') {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-screen text-muted-foreground p-4 text-center">
+        <motion.div
+            initial={{ opacity: 0, scale: 0.8 }}
+            animate={{ opacity: 1, scale: 1 }}
+            transition={{ type: 'spring', stiffness: 260, damping: 20 }}
+            className="flex flex-col items-center gap-4"
+        >
+            <ShieldCheck className="h-16 w-16 text-primary animate-pulse" />
+            <h2 className="text-2xl font-bold text-foreground">Third Umpire Review...</h2>
+            <p>Sending your scorecard for verification.</p>
+            <CricketLoading />
+        </motion.div>
+      </div>
+    );
+  }
+
+  if (quizState === 'ad-showing' && currentInterstitialConfig) {
+    if (currentInterstitialConfig.type === 'static' && currentInterstitialConfig.logoUrl) {
+      return (
+        <InterstitialLoader
+          logoUrl={currentInterstitialConfig.logoUrl}
+          logoHint={currentInterstitialConfig.logoHint || 'Featured sponsor'}
+          duration={currentInterstitialConfig.durationMs || 10000}
+          onComplete={onAdFinished}
+        />
+      );
+    }
+    if (currentInterstitialConfig.type === 'video' && currentInterstitialConfig.videoUrl) {
+      return (
+        <AdDialog
+          open={true}
+          onOpenChange={() => {}}
+          onAdFinished={onAdFinished}
+          duration={currentInterstitialConfig.durationSec || 40}
+          skippableAfter={currentInterstitialConfig.skippableAfterSec || 20}
+          adTitle={currentInterstitialConfig.videoTitle || 'Advertisement'}
+          adType="video"
+          adUrl={currentInterstitialConfig.videoUrl}
+        />
+      );
+    }
+
+    if (!currentInterstitialConfig.type || currentInterstitialConfig.type === 'static') {
+      return (
+        <AdDialog 
+            open={true}
+            onOpenChange={() => {}}
+            onAdFinished={onAdFinished}
+            duration={currentInterstitialConfig.durationSec || 10}
+            skippableAfter={currentInterstitialConfig.skippableAfterSec || 15}
+            adTitle={currentInterstitialConfig.logoHint || 'Advertisement'}
+            adType='image'
+            adUrl={currentInterstitialConfig.logoUrl || ''}
+        />
+      );
+    }
+  }
+
+  if (quizState === 'playing' && quizData) {
+  return (
+    <>
+      <QuizView
+        ref={quizViewRef}
+        question={quizData.questions[currentQuestionIndex]}
+        questionNumber={currentQuestionIndex + 1}
+        totalQuestions={quizData.questions.length}
+        onAnswer={handleNextQuestion}
+        onNoBall={handleNoBall}
+        brand={brand}
+        format={format}
+        onHintRequest={handleHintRequest}
+        hint={hints[currentQuestionIndex]}
+        isHintLoading={isHintLoading}
+        soundEnabled={settings.sound}
+        quizSource={quizSource}
+      />
+      {adForHint && (
+        <AdDialog
+          open={showAdDialog}
+          onOpenChange={setShowAdDialog}
+          onAdFinished={handleAdFinished}
+          duration={adForHint.duration}
+          skippableAfter={adForHint.skippableAfter}
+          adTitle={adForHint.title}
+          adType={adForHint.type}
+          adUrl={adForHint.url}
+          adHint={adForHint.hint}
+        />
+      )}
+    </>
+  );
+}
+
+
+  return <div className="flex items-center justify-center min-h-screen"><CricketLoading /></div>;
+}

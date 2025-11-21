@@ -1,0 +1,197 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ========= DASHBOARD - PUBLIC READ RULES FOR TESTING =========
+    match /quizAttempts/{docId} {
+      allow read: if true;
+      allow write: if request.auth != null;
+    }
+    match /payouts/{docId} {
+      allow read: if true;
+      allow write: if false;
+    }
+    match /adCampaigns/{docId} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    // ========== ADMIN COLLECTIONS ==========
+    match /admin_users/{uid} {
+      allow read: if request.auth != null;
+      allow create, update: if request.auth != null;
+      allow delete: if false;
+    }
+    
+    match /admin_activity_logs/{logId} {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null;
+      allow update, delete: if false;
+    }
+    
+    match /admin_sessions/{sessionId} {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null;
+      allow update: if request.auth != null;
+      allow delete: if false;
+    }
+
+    // ========== SUBMISSIONS COLLECTION (FIXED - NO CUSTOM CLAIMS REQUIRED) ==========
+    match /submissions/{submissionId} {
+      // ✅ Users can CREATE their own submissions
+      allow create: if request.auth != null &&
+                    request.resource.data.userId == request.auth.uid &&
+                    (request.resource.data.type == 'fact' || request.resource.data.type == 'question') &&
+                    request.resource.data.status == 'pending';
+
+      // ✅ ANYONE authenticated can READ all submissions (for admin dashboard)
+      allow read: if request.auth != null;
+
+      // ✅ ANYONE authenticated can UPDATE submissions (for admin approval)
+      allow update: if request.auth != null;
+
+      // ❌ No deletes allowed
+      allow delete: if false;
+    }
+
+    // ========== QUIZZES & QUESTIONS ==========
+    match /quizzes/{quizId} {
+      allow read: if true;
+      allow create, update: if request.auth != null;
+      allow delete: if false;
+      
+      match /questions/{questionId} {
+        allow read: if true;
+        allow create, update, delete: if request.auth != null;
+      }
+    }
+
+    // ========== SLOT WINS & ADS ==========
+    match /slotWins/{slotId} {
+      allow read: if request.auth != null;
+      allow create, update: if request.auth != null;
+      allow delete: if false;
+    }
+    
+    // ========== ADS COLLECTION - NEW AD MANAGEMENT SYSTEM ✅ ==========
+    match /ads/{adId} {
+      // ✅ PUBLIC READ - All authenticated users can see active ads
+      allow read: if request.auth != null && 
+                  resource.data.isActive == true;
+      
+      // ✅ PUBLIC READ (unauthenticated) - For displaying ads to users during quiz/rewards
+      allow read: if resource.data.isActive == true;
+      
+      // ✅ ADMIN ONLY - Create new ads (full CRUD for admin management)
+      allow create: if request.auth != null &&
+                    get(/databases/$(database)/documents/admin_users/$(request.auth.uid)).data.role == "admin";
+      
+      // ✅ ADMIN ONLY - Update ad details (revenue, status, etc.)
+      allow update: if request.auth != null &&
+                    get(/databases/$(database)/documents/admin_users/$(request.auth.uid)).data.role == "admin";
+      
+      // ✅ ADMIN ONLY - Delete ads
+      allow delete: if request.auth != null &&
+                    get(/databases/$(database)/documents/admin_users/$(request.auth.uid)).data.role == "admin";
+    }
+
+    // ========== AD VIEW LOGS - NEW TRACKING SYSTEM ✅ ==========
+    match /adViewLogs/{viewLogId} {
+      // ✅ Any authenticated user can CREATE view logs (when they see an ad)
+      allow create: if request.auth != null &&
+                    request.resource.data.userId == request.auth.uid &&
+                    request.resource.data.adId != null &&
+                    request.resource.data.viewedAt != null;
+      
+      // ✅ Users can READ their own view logs
+      allow read: if request.auth != null &&
+                  resource.data.userId == request.auth.uid;
+      
+      // ✅ ADMIN can READ all view logs for analytics
+      allow read: if request.auth != null &&
+                  get(/databases/$(database)/documents/admin_users/$(request.auth.uid)).data.role == "admin";
+      
+      // ✅ ADMIN only - Delete old logs if needed
+      allow delete: if request.auth != null &&
+                    get(/databases/$(database)/documents/admin_users/$(request.auth.uid)).data.role == "admin";
+    }
+
+    // ========== COMMENTARY SUBMISSIONS (LEGACY) ==========
+    match /commentarySubmissions/{submissionId} {
+      allow create: if request.auth != null &&
+                    request.resource.data.userId == request.auth.uid &&
+                    request.resource.data.status == "pending";
+      allow read: if request.auth != null;
+      allow update: if request.auth != null;
+      allow delete: if false;
+    }
+
+    // ========== USER COLLECTIONS ==========
+    match /globals/{docId} {
+      allow read: if true;
+      allow write: if request.auth != null;
+    }
+    
+    match /users/{userId} {
+      allow read: if true;
+      allow create: if request.auth != null && request.auth.uid == userId;
+      allow update: if request.auth != null && request.auth.uid == userId;
+      allow delete: if false;
+      
+      match /reviewState/{attemptId} {
+        allow read: if request.auth != null && request.auth.uid == userId;
+        allow create, update: if request.auth != null && request.auth.uid == userId;
+        allow delete: if false;
+      }
+      
+      match /quizAttempts/{attemptId} {
+        allow read: if request.auth != null && request.auth.uid == userId;
+        allow create: if request.auth != null && request.auth.uid == userId;
+        allow update: if request.auth != null && request.auth.uid == userId;
+        allow delete: if false;
+      }
+      
+      match /rewards/{rewardId} {
+        allow read: if request.auth != null && request.auth.uid == userId;
+        allow create: if request.auth != null && request.auth.uid == userId;
+        allow update, delete: if false;
+      }
+      
+      match /answers/{answerId} {
+        allow read: if request.auth != null && request.auth.uid == userId;
+        allow create, update: if request.auth != null && request.auth.uid == userId;
+        allow delete: if false;
+      }
+    }
+    
+    match /userQuestionHistory/{userId} {
+      allow read: if request.auth != null && request.auth.uid == userId;
+      allow write: if request.auth != null && request.auth.uid == userId;
+    }
+    
+    match /globalQuestionPool/{questionId} {
+      allow read: if true;
+      allow create, update: if request.auth != null;
+      allow delete: if false;
+    }
+
+    // ========== LEADERBOARD COLLECTIONS ==========
+    match /leaderboard_live/{slotId}/entries/{entryId} {
+      allow read: if true;
+      allow create: if request.auth != null && request.auth.uid == request.resource.data.userId;
+      allow update: if request.auth != null && request.auth.uid == resource.data.userId;
+      allow delete: if false;
+    }
+    
+    match /leaderboards/{leaderboardId} {
+      allow read: if true;
+      allow create, update: if request.auth != null;
+      allow delete: if false;
+    }
+
+    // ========== DEFAULT DENY ALL ==========
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

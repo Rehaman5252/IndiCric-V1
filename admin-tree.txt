@@ -1,0 +1,96 @@
+Folder PATH listing for volume Windows-SSD
+Volume serial number is 64AF-D573
+C:\USERS\NIDHISH\DOWNLOADS\NIDHISH-C2\NIDHISH-C\APP\ADMIN
+¦   layout.tsx
+¦   page.tsx
+¦   
++---activity-monitor
+¦       page.tsx
+¦       
++---admin-management
+¦       page.tsx
+¦       
++---admins
+¦       page.tsx
+¦       
++---ads
+¦   ¦   page.tsx
+¦   ¦   
+¦   +---all
+¦   ¦       page.tsx
+¦   ¦       
+¦   +---schedule
+¦   ¦       page.tsx
+¦   ¦       
+¦   +---upload
+¦           page.tsx
+¦           
++---alerts
+¦       page.tsx
+¦       
++---analytics
+¦       page.tsx
+¦       
++---audit-logs
+¦       page.tsx
+¦       
++---audit-trail
+¦       page.tsx
+¦       
++---backup
+¦       page.tsx
+¦       
++---content
+¦       page.tsx
+¦       
++---cube-logos
+¦       page.tsx
+¦       
++---dashboard
+¦       page.tsx
+¦       
++---finances
+¦       page.tsx
+¦       
++---login
+¦       page.tsx
+¦       
++---login-sessions
+¦       page.tsx
+¦       
++---payouts
+¦       page.tsx
+¦       
++---quiz
+¦   ¦   page.tsx
+¦   ¦   
+¦   +---all
+¦   ¦       page.tsx
+¦   ¦       
+¦   +---create
+¦   ¦       page.tsx
+¦   ¦       
+¦   +---questions
+¦   ¦       page.tsx
+¦   ¦       
+¦   +---schedule
+¦           page.tsx
+¦           
++---quizzes
+¦       page.tsx
+¦       
++---search
+¦       page.tsx
+¦       
++---settings
+¦       page.tsx
+¦       
++---submissions
+¦       page.tsx
+¦       
++---support
+¦       page.tsx
+¦       
++---users
+        page.tsx
+        
